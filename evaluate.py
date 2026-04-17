@@ -19,6 +19,8 @@ import subprocess
 import threading
 import argparse
 import random
+import os
+from concurrent.futures import ThreadPoolExecutor
 import requests
 import pandas as pd
 import numpy as np
@@ -238,6 +240,16 @@ class ExperimentRunner:
         self.request_log = []
         self.baseline_latency = None
 
+    def _send_request_with_delay(self, func, execute_at, start_time):
+        """延迟到指定时间发送请求"""
+        now = time.time()
+        if execute_at > now:
+            time.sleep(execute_at - now)
+
+        if time.time() - start_time < 3600:  # 检查是否仍在实验时间内
+            return invoke_function(func)
+        return None
+
     def run(self, duration, warmup):
         """运行一次完整实验"""
         print(f"\n{'='*60}")
@@ -295,35 +307,58 @@ class ExperimentRunner:
         status_thread = threading.Thread(target=collect_status, daemon=True)
         status_thread.start()
 
-        # 生成负载（Poisson过程）
+        # 启动状态收集线程
+        def collect_status():
+            while time.time() - start_time < duration:
+                status = get_worker_status()
+                self.status_history.append((time.time(), status))
+                time.sleep(5)
+
+        status_thread = threading.Thread(target=collect_status, daemon=True)
+        status_thread.start()
+
+        # 生成负载（异步并发版本）
         total_requests = 0
+        phase_start = time.time()
+
         for phase_duration, phase_qps in QPS_SCHEDULE:
             if time.time() - start_time >= duration:
                 break
 
             print(f"  阶段: QPS={phase_qps}, 持续={phase_duration}s")
+            phase_end = phase_start + phase_duration
 
-            # 生成Poisson到达
-            arrivals = poisson_arrivals(phase_qps, min(phase_duration, duration - (time.time() - start_time)))
-            arrivals.sort()
+            # 使用线程池并发发送请求
+            with ThreadPoolExecutor(max_workers=100) as executor:
+                futures = []
 
-            for arrival in arrivals:
-                if time.time() - start_time >= duration:
-                    break
+                # 在阶段时间内以目标QPS发送请求
+                request_interval = 1.0 / phase_qps
+                next_submit = time.time()
 
-                # 等待到到达时间
-                wait_time = arrival - (time.time() - start_time)
-                if wait_time > 0:
-                    time.sleep(wait_time)
+                while time.time() < phase_end and time.time() - start_time < duration:
+                    # 控制提交速率
+                    now = time.time()
+                    if now < next_submit:
+                        time.sleep(next_submit - now)
 
-                # 随机选择函数（均匀分布）
-                func = random.choice(["cpu_intensive", "io_mixed", "normal"])
-                result = invoke_function(func)
-                self.request_log.append(result)
-                total_requests += 1
+                    func = random.choice(["cpu_intensive", "io_mixed", "normal"])
+                    future = executor.submit(invoke_function, func)
+                    futures.append(future)
+                    total_requests += 1
 
-                if total_requests % 100 == 0:
-                    print(f"    已发送 {total_requests} 请求")
+                    next_submit += request_interval
+
+                # 等待所有已提交的请求完成（带超时）
+                for future in futures:
+                    try:
+                        result = future.result(timeout=120)  # 为cpu_intensive设置更长超时
+                        if result:
+                            self.request_log.append(result)
+                    except Exception as e:
+                        pass
+
+            phase_start = time.time()
 
         # 等待状态收集线程结束
         status_thread.join(timeout=10)

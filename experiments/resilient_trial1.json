@@ -1,8 +1,8 @@
 {
-  "cpu_utilization": 0.0,
+  "cpu_utilization": 91.52542372881355,
   "qos_violation_rate": 0.0,
   "scheduling_density": 1.0,
   "method": "resilient",
   "trial": 1,
-  "timestamp": "2026-04-17T12:44:34.643060"
+  "timestamp": "2026-04-17T13:17:06.667153"
 }
