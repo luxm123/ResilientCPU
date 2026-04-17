@@ -17,6 +17,8 @@ import time
 import json
 import subprocess
 import threading
+import argparse
+import random
 import requests
 import pandas as pd
 import numpy as np
@@ -26,7 +28,8 @@ from pathlib import Path
 import sys
 
 # 配置
-WORKER_IP = "172.31.26.175"
+# 通过环境变量 WORKER_IP 可覆盖，例如: export WORKER_IP=localhost
+WORKER_IP = os.environ.get("WORKER_IP", "172.31.26.175")
 CONTROLLER_IP = "172.31.31.194"
 BASE_DIR = Path("/home/ec2-user/ResilientCPU")
 EXPERIMENT_DIR = BASE_DIR / "experiments"
@@ -333,7 +336,7 @@ class ExperimentRunner:
         return metrics
 
 
-def run_trials(method_name, num_trials=3):
+def run_trials(method_name, num_trials=3, warmup_duration=120, run_duration=3600):
     """多次运行同一方法"""
     all_metrics = []
 
@@ -341,7 +344,7 @@ def run_trials(method_name, num_trials=3):
         print(f"\n{'='*20} 第{trial}次运行 {'='*20}")
 
         runner = ExperimentRunner(method_name)
-        metrics = runner.run(RUN_DURATION, WARMUP_DURATION)
+        metrics = runner.run(run_duration, warmup_duration)
 
         # 添加元数据
         metrics["method"] = method_name
@@ -373,17 +376,17 @@ def main():
     parser.add_argument("--warmup", type=int, default=WARMUP_DURATION, help="预热时长（秒）")
     args = parser.parse_args()
 
-    global RUN_DURATION, WARMUP_DURATION, REPEATS
-    RUN_DURATION = args.duration
-    WARMUP_DURATION = args.warmup
-    REPEATS = args.trials
+    # 使用局部变量，不修改全局常量
+    run_duration = args.duration
+    warmup_duration = args.warmup
+    repeats = args.trials
 
     print("=" * 60)
     print("ResilientCPU 实验评估")
     print("=" * 60)
     print(f"方法: {args.methods}")
-    print(f"每次运行: 预热{WARMUP_DURATION}s + 运行{RUN_DURATION}s")
-    print(f"重复次数: {REPEATS}")
+    print(f"每次运行: 预热{warmup_duration}s + 运行{run_duration}s")
+    print(f"重复次数: {repeats}")
     print(f"Worker: {WORKER_IP}")
     print("=" * 60)
 
@@ -395,7 +398,7 @@ def main():
             print(f"[WARN] 未知方法: {method}")
             continue
 
-        results = run_trials(method, REPEATS)
+        results = run_trials(method, repeats, warmup_duration, run_duration)
         all_results.extend(results)
 
     # 汇总结果

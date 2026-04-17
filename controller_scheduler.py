@@ -20,6 +20,7 @@ import math
 import random
 import threading
 import subprocess
+import os
 from datetime import datetime
 from collections import deque, defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -33,7 +34,8 @@ except ImportError:
 
 # ============ 配置 ============
 
-WORKER_IP = "172.31.26.175"
+# 通过环境变量 WORKER_IP 可覆盖，例如: export WORKER_IP=localhost
+WORKER_IP = os.environ.get("WORKER_IP", "172.31.26.175")
 WORKER_PORTS = {
     "cpu_intensive": 8081,
     "io_mixed": 8082,
