@@ -3,12 +3,14 @@
 ResilientCPU 实验评估脚本
 
 对比三种方法：
-1. Baseline - 无调度，固定CPU shares
-2. Jiagu-like - 基于阈值的简单补偿
-3. ResilientCPU - 基于敏感度曲线的智能补偿
+1. Baseline: 不超卖，每个函数独占资源（无调度）
+2. Jiagu-like: 离线训练模型，预测 capacity，调度时查表，不动态补偿
+3. ResilientCPU: 敏感度曲线 + 拐点判断 + 运行时动态调整CPU shares
 
-每个方法运行1小时，重复3次
-收集指标：CPU利用率、QoS违反率、调度密度
+实验流程：
+- 预热2分钟
+- 运行1小时，重复3次
+- 收集指标：CPU利用率、QoS违反率、调度密度、补偿响应时间
 """
 
 import time
@@ -19,454 +21,509 @@ import requests
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from collections import defaultdict
-import matplotlib.pyplot as plt
-import seaborn as sns
+from collections import defaultdict, deque
 from pathlib import Path
+import sys
 
 # 配置
 WORKER_IP = "172.31.26.175"
-WORKER_URL = f"http://{WORKER_IP}"
 CONTROLLER_IP = "172.31.31.194"
-EXPERIMENT_DIR = Path("/home/ec2-user/experiments")
-EXPERIMENT_DIR.mkdir(exist_ok=True)
+BASE_DIR = Path("/home/ec2-user/ResilientCPU")
+EXPERIMENT_DIR = BASE_DIR / "experiments"
+EXPERIMENT_DIR.mkdir(exist_ok=True, parents=True)
 
-# 方法配置
-METHODS = {
-    "baseline": {
-        "name": "Baseline",
-        "description": "固定CPU shares，无补偿机制"
-    },
-    "jiagu": {
-        "name": "Jiagu-like",
-        "description": "基于固定阈值的简单补偿（单阈值）"
-    },
-    "resilient": {
-        "name": "ResilientCPU",
-        "description": "基于敏感度曲线的自适应补偿"
-    }
+# 实验参数
+WARMUP_DURATION = 120  # 预热2分钟
+RUN_DURATION = 3600    # 运行1小时
+REPEATS = 3            # 重复3次
+
+# QoS阈值 = 基准延迟 × 1.5
+QOS_MULTIPLIER = 1.5
+
+# 基准延迟（单函数独占资源时的延迟，需要先测量）
+# 将在预热阶段自动测量
+BASELINE_LATENCY = {
+    "cpu_intensive": None,
+    "io_mixed": None,
+    "normal": None
 }
 
-# 函数QoS阈值（ms）
-QOS_THRESHOLDS = {
-    "cpu_intensive": 100,
-    "io_mixed": 200,
-    "normal": 300
-}
+# Poisson过程的QPS变化（10到100）
+QPS_SCHEDULE = [
+    (300, 10),   # 前5分钟：QPS=10
+    (300, 20),   # 5-10分钟：QPS=20
+    (300, 30),   # 10-15分钟：QPS=30
+    (600, 50),   # 15-25分钟：QPS=50
+    (600, 70),   # 25-35分钟：QPS=70
+    (600, 100),  # 35-45分钟：QPS=100
+    (300, 50),   # 45-50分钟：QPS=50
+    (300, 20),   # 50-55分钟：QPS=20
+    (300, 10),   # 55-60分钟：QPS=10
+]
 
+
+# ============ 辅助函数 ============
+
+def poisson_arrivals(qps, duration):
+    """生成Poisson请求到达时间"""
+    arrivals = []
+    t = 0
+    while t < duration:
+        interval = random.expovariate(qps)
+        t += interval
+        if t < duration:
+            arrivals.append(t)
+    return arrivals
+
+
+def get_worker_status():
+    """获取所有函数状态"""
+    status = {}
+    for func, port in [("cpu_intensive", 8081), ("io_mixed", 8082), ("normal", 8083)]:
+        try:
+            resp = requests.get(f"http://{WORKER_IP}:{port}/status", timeout=2)
+            if resp.status_code == 200:
+                status[func] = resp.json()
+        except Exception as e:
+            print(f"[WARN] 获取 {func} 状态失败: {e}")
+            status[func] = None
+    return status
+
+
+def invoke_function(func_name):
+    """调用函数"""
+    port = {"cpu_intensive": 8081, "io_mixed": 8082, "normal": 8083}[func_name]
+    try:
+        resp = requests.post(f"http://{WORKER_IP}:{port}/invoke", timeout=30)
+        latency = resp.json().get("latency_ms", 0) if resp.status_code == 200 else -1
+        return {"function": func_name, "latency_ms": latency, "success": resp.status_code == 200}
+    except:
+        return {"function": func_name, "latency_ms": -1, "success": False}
+
+
+def measure_baseline_latency():
+    """
+    测量基准延迟
+    需要确保每个函数独占资源时测量
+    返回: {func_name: baseline_latency_ms}
+    """
+    print("\n=== 测量基准延迟 ===")
+
+    # 重置worker状态
+    try:
+        requests.post(f"http://{WORKER_IP}:8081/reset")
+    except:
+        pass
+
+    # 对每个函数单独测量
+    baselines = {}
+
+    for func_name in ["cpu_intensive", "io_mixed", "normal"]:
+        print(f"  测量 {func_name} 基准延迟...")
+        latencies = []
+
+        for _ in range(10):
+            result = invoke_function(func_name)
+            if result["success"]:
+                latencies.append(result["latency_ms"])
+            time.sleep(0.5)
+
+        if latencies:
+            baseline = sum(latencies) / len(latencies)
+            baselines[func_name] = baseline
+            print(f"    {func_name}: {baseline:.2f} ms")
+
+    # 设置worker的基准值
+    for func_name, baseline in baselines.items():
+        try:
+            requests.post(
+                f"http://{WORKER_IP}:{WORKER_PORTS[func_name]}/set_baseline",
+                json={"function": func_name, "baseline_latency_ms": baseline}
+            )
+        except:
+            pass
+
+    return baselines
+
+
+def calculate_metrics(status_history, request_log, baseline_latency):
+    """
+    计算实验指标
+
+    参数:
+    - status_history: [(timestamp, status_dict), ...]
+    - request_log: [{"function": ..., "latency_ms": ..., "success": ...}, ...]
+    - baseline_latency: {func: baseline_ms}
+
+    返回:
+    - metrics: dict
+    """
+    print("\n=== 计算指标 ===")
+
+    metrics = {}
+
+    # 1. CPU利用率（通过CPU shares的平均值估算）
+    # Baseline模式：每个函数独占1024 shares，利用率取决于负载
+    # 超卖模式：总shares > 1024*3，利用率更高
+
+    # 收集每个时刻的shares分配
+    total_shares_samples = []
+    for ts, status in status_history:
+        total = 0
+        for func, s in status.items():
+            if s:
+                total += s.get("cpu_shares", 1024)
+        total_shares_samples.append(total)
+
+    if total_shares_samples:
+        # Baseline: 每个1024，总共3072
+        baseline_total_shares = 1024 * 3
+        avg_total_shares = sum(total_shares_samples) / len(total_shares_samples)
+
+        # CPU利用率 = (平均总shares / 基准总shares) × 100%
+        # 注意：这里假设shares完全对应CPU资源，实际会有偏差
+        metrics["cpu_utilization"] = min(100.0, avg_total_shares / baseline_total_shares * 100)
+        print(f"  CPU利用率: {metrics['cpu_utilization']:.2f}%")
+
+    # 2. QoS违反率
+    qos_violations = 0
+    total_requests = 0
+
+    for req in request_log:
+        if not req.get("success", False):
+            total_requests += 1
+            continue
+
+        func = req["function"]
+        latency = req.get("latency_ms", 0)
+        baseline = baseline_latency.get(func, latency)
+        qos_threshold = baseline * QOS_MULTIPLIER
+
+        if latency > qos_threshold:
+            qos_violations += 1
+
+        total_requests += 1
+
+    if total_requests > 0:
+        metrics["qos_violation_rate"] = qos_violations / total_requests * 100
+        print(f"  QoS违反率: {metrics['qos_violation_rate']:.2f}%")
+
+    # 3. 调度密度
+    # 定义为：每个函数平均的CPU shares调整次数/秒
+    metrics["scheduling_density"] = len(status_history) / len(status_history) if status_history else 0
+    print(f"  调度密度: {metrics['scheduling_density']:.2f} 次/秒")
+
+    # 4. 补偿响应时间（仅ResilientCPU）
+    # 需要从scheduler获取
+    if hasattr(current_scheduler, 'recovery_times'):
+        recovery_times = current_scheduler.recovery_times
+        if recovery_times:
+            metrics["compensation_response_time_ms"] = np.mean(recovery_times) * 1000
+            print(f"  补偿响应时间: {metrics['compensation_response_time_ms']:.2f} ms")
+
+    return metrics
+
+
+# ============ 实验运行器 ============
 
 class ExperimentRunner:
-    """实验运行器"""
+    """单次实验运行器"""
 
-    def __init__(self, method_name, worker_ip=WORKER_IP):
+    def __init__(self, method_name):
         self.method_name = method_name
-        self.worker_ip = worker_ip
-        self.start_time = None
-        self.end_time = None
-        self.metrics = defaultdict(list)
+        self.status_history = []
         self.request_log = []
+        self.baseline_latency = None
 
-    def log(self, metric_type, data):
-        """记录指标"""
-        self.metrics[metric_type].append({
-            "timestamp": time.time(),
-            "data": data
-        })
+    def run(self, duration, warmup):
+        """运行一次完整实验"""
+        print(f"\n{'='*60}")
+        print(f"方法: {self.method_name}")
+        print(f"运行时长: {duration}秒, 预热: {warmup}秒")
+        print(f"{'='*60}")
 
-    def run_baseline(self, duration_seconds):
-        """
-        Baseline方法：固定CPU shares，不进行任何调度
-        """
-        print(f"\n[{datetime.now()}] 运行 Baseline 方法 ({duration_seconds}秒)")
+        # 1. 测量基准延迟（只需要第一次运行前测量一次）
+        if self.method_name == "baseline":
+            # Baseline需要先测量每个函数的独占基准
+            self.baseline_latency = measure_baseline_latency()
+        else:
+            # 其他方法使用预定义的基准值
+            self.baseline_latency = {
+                "cpu_intensive": 21000,
+                "io_mixed": 15,
+                "normal": 0.1
+            }
 
-        # 重置worker状态（通过重启或API，这里假设初始状态）
-        # Baseline不做任何调度，只是被动记录
+        # 2. 选择调度器
+        global current_scheduler
+        if self.method_name == "baseline":
+            from controller_scheduler import BaselineScheduler
+            scheduler = BaselineScheduler()
+        elif self.method_name == "jiagu":
+            from controller_scheduler import JiaguLikeScheduler
+            scheduler = JiaguLikeScheduler()
+        else:
+            from controller_scheduler import ResilientCPUScheduler
+            scheduler = ResilientCPUScheduler()
 
-        # 启动一个线程定期收集指标
-        stop_collection = threading.Event()
+        current_scheduler = scheduler
 
-        def collect_metrics():
-            while not stop_collection.is_set():
-                try:
-                    # 获取各函数状态
-                    for func_name, port in [("cpu_intensive", 8081),
-                                              ("io_mixed", 8082),
-                                              ("normal", 8083)]:
-                        resp = requests.get(f"http://{self.worker_ip}:{port}/status", timeout=2)
-                        if resp.status_code == 200:
-                            status = resp.json()
-                            self.log("latency", {
-                                "function": func_name,
-                                "latency_ms": status.get("avg_latency_ms", 0),
-                                "cpu_shares": status.get("cpu_shares", 1024)
-                            })
-                except Exception as e:
-                    print(f"收集指标失败: {e}")
+        # 3. 重置worker
+        try:
+            requests.post(f"http://{WORKER_IP}:8081/reset")
+        except:
+            pass
 
+        # 4. 预热阶段（不记录数据，但让系统稳定）
+        print(f"\n--- 预热阶段 ({warmup}s) ---")
+        time.sleep(warmup)
+
+        # 5. 正式运行阶段
+        print(f"\n--- 正式运行阶段 ({duration}s) ---")
+        start_time = time.time()
+
+        # 启动状态收集线程
+        def collect_status():
+            while time.time() - start_time < duration:
+                status = get_worker_status()
+                self.status_history.append((time.time(), status))
                 time.sleep(5)
 
-        collector_thread = threading.Thread(target=collect_metrics, daemon=True)
-        collector_thread.start()
+        status_thread = threading.Thread(target=collect_status, daemon=True)
+        status_thread.start()
 
-        # 等待指定时间
-        time.sleep(duration_seconds)
-        stop_collection.set()
-        collector_thread.join(timeout=2)
-
-        print(f"[{datetime.now()}] Baseline 运行完成")
-
-    def run_jiagu(self, duration_seconds):
-        """
-        Jiagu-like方法：基于单一阈值的补偿
-        策略：如果任意函数延迟超过其QoS阈值的150%，则从normal函数借256 shares
-        """
-        print(f"\n[{datetime.now()}] 运行 Jiagu-like 方法 ({duration_seconds}秒)")
-
-        stop_collection = threading.Event()
-
-        def collect_and_schedule():
-            while not stop_collection.is_set():
-                try:
-                    # 获取各函数状态
-                    status = {}
-                    for func_name, port in [("cpu_intensive", 8081),
-                                              ("io_mixed", 8082),
-                                              ("normal", 8083)]:
-                        resp = requests.get(f"http://{self.worker_ip}:{port}/status", timeout=2)
-                        if resp.status_code == 200:
-                            status[func_name] = resp.json()
-
-                    # 检查是否需要补偿
-                    for func_name, func_status in status.items():
-                        if func_status:
-                            latency = func_status.get("avg_latency_ms", 0)
-                            threshold = QOS_THRESHOLDS[func_name]
-
-                            # 如果延迟超过阈值150%，从normal借资源
-                            if latency > threshold * 1.5 and func_name != "normal":
-                                try:
-                                    requests.post(
-                                        f"http://{self.worker_ip}:8081/compensate",
-                                        json={"donor": "normal", "amount": 256},
-                                        timeout=2
-                                    )
-                                    print(f"Jiagu: {func_name} 延迟过高({latency:.1f}ms), 从normal借256 shares")
-                                except:
-                                    pass
-
-                    # 记录指标
-                    for func_name, func_status in status.items():
-                        if func_status:
-                            self.log("latency", {
-                                "function": func_name,
-                                "latency_ms": func_status.get("avg_latency_ms", 0),
-                                "cpu_shares": func_status.get("cpu_shares", 1024)
-                            })
-
-                except Exception as e:
-                    print(f"Jiagu调度错误: {e}")
-
-                time.sleep(5)
-
-        scheduler_thread = threading.Thread(target=collect_and_schedule, daemon=True)
-        scheduler_thread.start()
-
-        time.sleep(duration_seconds)
-        stop_collection.set()
-        scheduler_thread.join(timeout=2)
-
-        print(f"[{datetime.now()}] Jiagu-like 运行完成")
-
-    def run_resilient(self, duration_seconds):
-        """
-        ResilientCPU方法：基于敏感度曲线的自适应补偿
-        """
-        print(f"\n[{datetime.now()}] 运行 ResilientCPU 方法 ({duration_seconds}秒)")
-
-        stop_collection = threading.Event()
-
-        def collect_and_schedule():
-            while not stop_collection.is_set():
-                try:
-                    # 获取各函数状态
-                    status = {}
-                    for func_name, port in [("cpu_intensive", 8081),
-                                              ("io_mixed", 8082),
-                                              ("normal", 8083)]:
-                        resp = requests.get(f"http://{self.worker_ip}:{port}/status", timeout=2)
-                        if resp.status_code == 200:
-                            status[func_name] = resp.json()
-
-                    # 计算CPU争抢程度（基于延迟增长）
-                    contention_scores = []
-                    for func_name, func_status in status.items():
-                        if func_status:
-                            # 简单估算：当前延迟 / QoS阈值
-                            latency = func_status.get("avg_latency_ms", 0)
-                            threshold = QOS_THRESHOLDS[func_name]
-                            contention_scores.append(min(1.0, latency / threshold / 2))
-
-                    contention = np.mean(contention_scores) if contention_scores else 0.0
-
-                    # 决策补偿
-                    # 如果争抢程度较低（<0.5），且高敏感函数延迟超标
-                    if contention < 0.5:
-                        for func_name in ["cpu_intensive", "io_mixed"]:
-                            if status.get(func_name):
-                                latency = status[func_name].get("avg_latency_ms", 0)
-                                if latency > QOS_THRESHOLDS[func_name]:
-                                    # 从normal借资源
-                                    try:
-                                        requests.post(
-                                            f"http://{self.worker_ip}:8081/compensate",
-                                            json={"donor": "normal", "amount": 256},
-                                            timeout=2
-                                        )
-                                        print(f"Resilient: {func_name} 需要补偿, 从normal借256 shares")
-                                    except:
-                                        pass
-
-                    # 记录指标
-                    for func_name, func_status in status.items():
-                        if func_status:
-                            self.log("latency", {
-                                "function": func_name,
-                                "latency_ms": func_status.get("avg_latency_ms", 0),
-                                "cpu_shares": func_status.get("cpu_shares", 1024),
-                                "contention": contention
-                            })
-
-                except Exception as e:
-                    print(f"Resilient调度错误: {e}")
-
-                time.sleep(5)
-
-        scheduler_thread = threading.Thread(target=collect_and_schedule, daemon=True)
-        scheduler_thread.start()
-
-        time.sleep(duration_seconds)
-        stop_collection.set()
-        scheduler_thread.join(timeout=2)
-
-        print(f"[{datetime.now()}] ResilientCPU 运行完成")
-
-    def calculate_metrics(self):
-        """计算实验指标"""
-        results = {
-            "cpu_utilization": 0.0,
-            "qos_violation_rate": 0.0,
-            "scheduling_density": 0.0
-        }
-
-        # 1. CPU利用率估算（基于CPU shares分配）
-        total_shares_time = defaultdict(float)
-        sample_count = 0
-
-        for entry in self.metrics["latency"]:
-            data = entry["data"]
-            func = data["function"]
-            shares = data.get("cpu_shares", 1024)
-            total_shares_time[func] += shares
-            sample_count += 1
-
-        if sample_count > 0:
-            avg_shares = sum(total_shares_time.values()) / (3 * sample_count)
-            max_shares = 1024 * 3
-            results["cpu_utilization"] = avg_shares / max_shares * 100
-
-        # 2. QoS违反率
-        qos_violations = 0
+        # 生成负载（Poisson过程）
         total_requests = 0
-        for entry in self.metrics["latency"]:
-            data = entry["data"]
-            func = data["function"]
-            latency = data.get("latency_ms", 0)
-            if latency > QOS_THRESHOLDS[func]:
-                qos_violations += 1
-            total_requests += 1
+        for phase_duration, phase_qps in QPS_SCHEDULE:
+            if time.time() - start_time >= duration:
+                break
 
-        results["qos_violation_rate"] = qos_violations / total_requests * 100 if total_requests > 0 else 0
+            print(f"  阶段: QPS={phase_qps}, 持续={phase_duration}s")
 
-        # 3. 调度密度（每单位时间的调度次数）
-        # 这里简化为记录的metrics数量 / 持续时间
-        if self.start_time and self.end_time:
-            duration = self.end_time - self.start_time
-            results["scheduling_density"] = len(self.metrics["latency"]) / duration if duration > 0 else 0
+            # 生成Poisson到达
+            arrivals = poisson_arrivals(phase_qps, min(phase_duration, duration - (time.time() - start_time)))
+            arrivals.sort()
 
-        return results
+            for arrival in arrivals:
+                if time.time() - start_time >= duration:
+                    break
 
+                # 等待到到达时间
+                wait_time = arrival - (time.time() - start_time)
+                if wait_time > 0:
+                    time.sleep(wait_time)
 
-def run_experiment(method_key, run_id, duration_seconds=3600):
-    """
-    运行单次实验
+                # 随机选择函数（均匀分布）
+                func = random.choice(["cpu_intensive", "io_mixed", "normal"])
+                result = invoke_function(func)
+                self.request_log.append(result)
+                total_requests += 1
 
-    Args:
-        method_key: 方法key ("baseline", "jiagu", "resilient")
-        run_id: 实验重复ID (1, 2, 3)
-        duration_seconds: 每次运行时长（默认1小时）
-    """
-    print(f"\n{'='*60}")
-    print(f"实验: {METHODS[method_key]['name']} - 第{run_id}次运行")
-    print(f"{'='*60}")
+                if total_requests % 100 == 0:
+                    print(f"    已发送 {total_requests} 请求")
 
-    runner = ExperimentRunner(method_key)
-    runner.start_time = time.time()
+        # 等待状态收集线程结束
+        status_thread.join(timeout=10)
 
-    try:
-        if method_key == "baseline":
-            runner.run_baseline(duration_seconds)
-        elif method_key == "jiagu":
-            runner.run_jiagu(duration_seconds)
-        elif method_key == "resilient":
-            runner.run_resilient(duration_seconds)
+        print(f"\n实验完成，共发送 {total_requests} 请求")
 
-        runner.end_time = time.time()
+        # 6. 计算指标
+        metrics = calculate_metrics(self.status_history, self.request_log, self.baseline_latency)
 
-        # 计算指标
-        metrics = runner.calculate_metrics()
-        metrics["method"] = method_key
-        metrics["run_id"] = run_id
-        metrics["duration"] = duration_seconds
-
-        print(f"\n实验结果:")
-        print(f"  CPU利用率: {metrics['cpu_utilization']:.2f}%")
-        print(f"  QoS违反率: {metrics['qos_violation_rate']:.2f}%")
-        print(f"  调度密度: {metrics['scheduling_density']:.2f} 次/秒")
-
-        # 保存结果
-        result_file = EXPERIMENT_DIR / f"{method_key}_run{run_id}_results.json"
-        with open(result_file, 'w') as f:
-            json.dump({
-                "method": method_key,
-                "run_id": run_id,
-                "timestamp": time.time(),
-                "metrics": metrics,
-                "raw_metrics_count": {k: len(v) for k, v in runner.metrics.items()}
-            }, f, indent=2)
-
-        print(f"结果保存到: {result_file}")
         return metrics
 
-    except Exception as e:
-        print(f"实验失败: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
+
+def run_trials(method_name, num_trials=3):
+    """多次运行同一方法"""
+    all_metrics = []
+
+    for trial in range(1, num_trials + 1):
+        print(f"\n{'='*20} 第{trial}次运行 {'='*20}")
+
+        runner = ExperimentRunner(method_name)
+        metrics = runner.run(RUN_DURATION, WARMUP_DURATION)
+
+        # 添加元数据
+        metrics["method"] = method_name
+        metrics["trial"] = trial
+        metrics["timestamp"] = datetime.now().isoformat()
+
+        all_metrics.append(metrics)
+
+        # 保存单次结果
+        trial_file = EXPERIMENT_DIR / f"{method_name}_trial{trial}.json"
+        with open(trial_file, 'w') as f:
+            json.dump(metrics, f, indent=2)
+        print(f"结果保存到: {trial_file}")
+
+        # 两次运行之间等待一下
+        if trial < num_trials:
+            print("等待60秒后开始下一次运行...")
+            time.sleep(60)
+
+    return all_metrics
 
 
 def main():
-    parser = argparse.ArgumentParser(description="ResilientCPU 实验评估")
-    parser.add_argument("--duration", type=int, default=3600, help="每次运行时长（秒，默认3600=1小时）")
-    parser.add_argument("--repeats", type=int, default=3, help="重复次数（默认3次）")
+    parser = argparse.ArgumentParser(description="ResilientCPU实验评估")
     parser.add_argument("--methods", nargs="+", default=["baseline", "jiagu", "resilient"],
-                       help="要运行的方法列表")
+                       help="要运行的方法")
+    parser.add_argument("--trials", type=int, default=REPEATS, help="重复次数")
+    parser.add_argument("--duration", type=int, default=RUN_DURATION, help="每次运行时长（秒）")
+    parser.add_argument("--warmup", type=int, default=WARMUP_DURATION, help="预热时长（秒）")
     args = parser.parse_args()
+
+    global RUN_DURATION, WARMUP_DURATION, REPEATS
+    RUN_DURATION = args.duration
+    WARMUP_DURATION = args.warmup
+    REPEATS = args.trials
 
     print("=" * 60)
     print("ResilientCPU 实验评估")
     print("=" * 60)
-    print(f"实验配置:")
-    print(f"  每次运行时长: {args.duration}秒 ({args.duration/3600:.1f}小时)")
-    print(f"  重复次数: {args.repeats}")
-    print(f"  方法: {args.methods}")
-    print(f"  Worker地址: {WORKER_URL}")
+    print(f"方法: {args.methods}")
+    print(f"每次运行: 预热{WARMUP_DURATION}s + 运行{RUN_DURATION}s")
+    print(f"重复次数: {REPEATS}")
+    print(f"Worker: {WORKER_IP}")
+    print("=" * 60)
 
     all_results = []
 
-    # 对每个方法运行指定次数
+    # 运行每个方法
     for method in args.methods:
-        if method not in METHODS:
-            print(f"警告: 未知方法 '{method}'，跳过")
+        if method not in ["baseline", "jiagu", "resilient"]:
+            print(f"[WARN] 未知方法: {method}")
             continue
 
-        for run_id in range(1, args.repeats + 1):
-            result = run_experiment(method, run_id, args.duration)
-            if result:
-                all_results.append(result)
-
-            # 两次运行之间休息一下
-            if run_id < args.repeats:
-                print(f"等待30秒后开始下一次运行...")
-                time.sleep(30)
+        results = run_trials(method, REPEATS)
+        all_results.extend(results)
 
     # 汇总结果
     if all_results:
-        print("\n\n========== 实验汇总 ==========")
+        print("\n\n========== 实验结果汇总 ==========")
+
         df = pd.DataFrame(all_results)
 
+        # 显示每个方法的平均指标
         for method in args.methods:
-            method_results = df[df["method"] == method]
-            if len(method_results) > 0:
-                print(f"\n{METHODS[method]['name']}:")
-                for metric in ["cpu_utilization", "qos_violation_rate", "scheduling_density"]:
-                    values = method_results[metric].values
-                    print(f"  {metric}: {np.mean(values):.2f} ± {np.std(values):.2f}")
+            method_df = df[df["method"] == method]
+            if len(method_df) > 0:
+                print(f"\n{method.upper()}:")
+                for col in ["cpu_utilization", "qos_violation_rate", "scheduling_density"]:
+                    if col in method_df.columns:
+                        mean = method_df[col].mean()
+                        std = method_df[col].std()
+                        print(f"  {col}: {mean:.2f} ± {std:.2f}")
+
+                # 补偿响应时间（仅ResilientCPU）
+                if "compensation_response_time_ms" in method_df.columns:
+                    crt = method_df["compensation_response_time_ms"].mean()
+                    print(f"  补偿响应时间: {crt:.2f} ms")
 
         # 保存汇总
         summary_file = EXPERIMENT_DIR / "summary.csv"
         df.to_csv(summary_file, index=False)
-        print(f"\n汇总保存到: {summary_file}")
+        print(f"\n汇总数据保存到: {summary_file}")
 
-        # 生成可视化图表
-        generate_plots(df)
+        # 生成对比图表
+        generate_comparison_plots(df)
 
     else:
-        print("\n警告: 没有收集到实验结果")
+        print("\n[ERROR] 没有实验结果")
 
 
-def generate_plots(df):
+def generate_comparison_plots(df):
     """生成对比图表"""
     try:
         import matplotlib
-        matplotlib.use('Agg')  # 非交���式后端
+        matplotlib.use('Agg')
         import matplotlib.pyplot as plt
         import seaborn as sns
 
-        # 设置样式
-        plt.style.use('seaborn-v0_8-darkgrid')
-        sns.set_palette("husl")
+        methods = [m for m in ["baseline", "jiagu", "resilient"] if m in df["method"].unique()]
 
         fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
-        # 1. CPU利用率对比
-        cpu_means = [df[df["method"] == m]["cpu_utilization"].mean() for m in METHODS.keys()]
-        cpu_stds = [df[df["method"] == m]["cpu_utilization"].std() for m in METHODS.keys()]
-        axes[0].bar(range(len(METHODS)), cpu_means, yerr=cpu_stds, capsize=5)
+        # 1. CPU利用率
+        cpu_means = [df[df["method"] == m]["cpu_utilization"].mean() for m in methods]
+        cpu_stds = [df[df["method"] == m]["cpu_utilization"].std() for m in methods]
+        axes[0].bar(range(len(methods)), cpu_means, yerr=cpu_stds, capsize=5, color='steelblue')
         axes[0].set_xlabel("Method")
         axes[0].set_ylabel("CPU Utilization (%)")
         axes[0].set_title("CPU Utilization Comparison")
-        axes[0].set_xticks(range(len(METHODS)))
-        axes[0].set_xticklabels([METHODS[m]["name"] for m in METHODS.keys()])
+        axes[0].set_xticks(range(len(methods)))
+        axes[0].set_xticklabels([m.capitalize() for m in methods])
 
-        # 2. QoS违反率对比
-        qos_means = [df[df["method"] == m]["qos_violation_rate"].mean() for m in METHODS.keys()]
-        qos_stds = [df[df["method"] == m]["qos_violation_rate"].std() for m in METHODS.keys()]
-        axes[1].bar(range(len(METHODS)), qos_means, yerr=qos_stds, capsize=5, color='orange')
+        # 2. QoS违反率
+        qos_means = [df[df["method"] == m]["qos_violation_rate"].mean() for m in methods]
+        qos_stds = [df[df["method"] == m]["qos_violation_rate"].std() for m in methods]
+        axes[1].bar(range(len(methods)), qos_means, yerr=qos_stds, capsize=5, color='coral')
         axes[1].set_xlabel("Method")
         axes[1].set_ylabel("QoS Violation Rate (%)")
         axes[1].set_title("QoS Violation Rate Comparison")
-        axes[1].set_xticks(range(len(METHODS)))
-        axes[1].set_xticklabels([METHODS[m]["name"] for m in METHODS.keys()])
+        axes[1].set_xticks(range(len(methods)))
+        axes[1].set_xticklabels([m.capitalize() for m in methods])
 
-        # 3. 调度密度对比
-        density_means = [df[df["method"] == m]["scheduling_density"].mean() for m in METHODS.keys()]
-        density_stds = [df[df["method"] == m]["scheduling_density"].std() for m in METHODS.keys()]
-        axes[2].bar(range(len(METHODS)), density_means, yerr=density_stds, capsize=5, color='green')
+        # 3. 调度密度
+        density_means = [df[df["method"] == m]["scheduling_density"].mean() for m in methods]
+        density_stds = [df[df["method"] == m]["scheduling_density"].std() for m in methods]
+        axes[2].bar(range(len(methods)), density_means, yerr=density_stds, capsize=5, color='forestgreen')
         axes[2].set_xlabel("Method")
-        axes[2].set_ylabel("Scheduling Density (ops/sec)")
+        axes[2].set_ylabel("Scheduling Density (ops/s)")
         axes[2].set_title("Scheduling Density Comparison")
-        axes[2].set_xticks(range(len(METHODS)))
-        axes[2].set_xticklabels([METHODS[m]["name"] for m in METHODS.keys()])
+        axes[2].set_xticks(range(len(methods)))
+        axes[2].set_xticklabels([m.capitalize() for m in methods])
 
         plt.tight_layout()
         plot_file = EXPERIMENT_DIR / "comparison_plot.png"
         plt.savefig(plot_file, dpi=150)
-        print(f"\n对比图表保存到: {plot_file}")
+        print(f"\n图表保存到: {plot_file}")
 
-    except ImportError:
-        print("\n警告: matplotlib/seaborn未安装，跳过图表生成")
+        # 详细对比表
+        fig2, ax2 = plt.subplots(figsize=(10, 6))
+        ax2.axis('tight')
+        ax2.axis('off')
+
+        table_data = []
+        headers = ["Method", "CPU Util (%)", "QoS Viol (%)", "Sched Density", "Resp Time (ms)"]
+        for method in methods:
+            row = [method.capitalize()]
+            for col in ["cpu_utilization", "qos_violation_rate", "scheduling_density"]:
+                if col in df.columns:
+                    val = df[df["method"] == method][col].mean()
+                    row.append(f"{val:.1f}")
+                else:
+                    row.append("N/A")
+            # 补偿响应时间
+            if "compensation_response_time_ms" in df.columns:
+                crt = df[df["method"] == method]["compensation_response_time_ms"].mean()
+                row.append(f"{crt:.1f}" if not pd.isna(crt) else "N/A")
+            else:
+                row.append("N/A")
+            table_data.append(row)
+
+        table = ax2.table(cellText=table_data, colLabels=headers, loc='center', cellLoc='center')
+        table.auto_set_font_size(False)
+        table.set_fontsize(10)
+        table.scale(1, 2)
+
+        plt.savefig(EXPERIMENT_DIR / "comparison_table.png", dpi=150, bbox_inches='tight')
+        print(f"对比表保存到: {EXPERIMENT_DIR / 'comparison_table.png'}")
+
+    except ImportError as e:
+        print(f"[WARN] 缺少绘图依赖: {e}")
 
 
 if __name__ == "__main__":
-    import argparse
+    # 安装依赖检查
+    try:
+        import requests
+        import pandas as pd
+        import numpy as np
+        import matplotlib
+    except ImportError as e:
+        print(f"缺少依赖: {e}")
+        print("请安装: pip install requests pandas numpy matplotlib seaborn")
+        sys.exit(1)
+
     main()
