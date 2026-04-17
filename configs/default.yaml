@@ -1,0 +1,54 @@
+# ResilientCPU 项目配置
+# =======================
+
+project:
+  name: ResilientCPU
+  version: 1.0.0
+  description: 基于干扰容忍的FaaS调度系统
+
+# 仿真参数
+simulation:
+  duration: 3600  # 仿真时长（秒）
+  warmup: 300     # 预热时间（秒）
+  cooldown: 300   # 冷却时间（秒）
+
+# 机器配置
+machines:
+  - id: machine_0
+    cpu_cores: 8
+    memory_gb: 32
+    max_cpu_shares: 1024  # cgroup CPU shares 上限
+
+# 函数配置模板
+function_template:
+  execution_time_mean: 1.0      # 平均执行时间（秒）
+  execution_time_std: 0.2       # 执行时间标准差
+  memory_mb: 512                # 内存需求（MB）
+  cpu_requirements: 1           # CPU核心需求
+
+# 干扰模式
+interference:
+  enabled: true
+  patterns:
+    - periodic      # 周期性干扰
+    - burst         # 突发性干扰
+    - sustained     # 持续性干扰
+
+# 调度策略
+scheduler:
+  strategy: "resilient"  # resilient | conservative | aggressive
+  sensitivity_threshold: 0.95  # 性能保持率阈值（95%）
+  borrow_ratio: 0.3      # 可从低敏感度函数借用的CPU比例
+  compensation_delay: 50  # 补偿延迟阈值（毫秒）
+
+# 监控配置
+monitor:
+  interval: 0.1          # 监控采样间隔（秒）
+  window_size: 10        # 滑动窗口大小（用于计算延迟百分位数）
+  alert_threshold: 1.5   # 延迟告警倍数
+
+# 输出配置
+output:
+  results_dir: "results"
+  plots: true
+  detailed_logs: true

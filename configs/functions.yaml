@@ -1,0 +1,121 @@
+# 函数敏感度曲线预设
+# =====================
+# 用于为函数生成模拟的敏感度曲线
+
+# 敏感度等级：high | medium | low
+# - high: 对CPU争抢非常敏感（如CPU密集型计算）
+# - medium: 中等敏感度
+# - low: 对争抢不敏感（如I/O密集型）
+
+functions:
+  - name: "ImageResize"
+    cpu_cores: 2.0
+    sensitivity: "high"
+    base_latency_ms: 500
+    sla_timeout_ms: 1500
+
+  - name: "ImageFilter"
+    cpu_cores: 2.0
+    sensitivity: "high"
+    base_latency_ms: 1200
+    sla_timeout_ms: 3600
+
+  - name: "MLInference"
+    cpu_cores: 3.0
+    sensitivity: "medium"
+    base_latency_ms: 800
+    sla_timeout_ms: 2400
+
+  - name: "DataCompress"
+    cpu_cores: 1.5
+    sensitivity: "medium"
+    base_latency_ms: 2000
+    sla_timeout_ms: 6000
+
+  - name: "TextParse"
+    cpu_cores: 0.5
+    sensitivity: "low"
+    base_latency_ms: 300
+    sla_timeout_ms: 900
+
+  - name: "LogProcess"
+    cpu_cores: 0.5
+    sensitivity: "low"
+    base_latency_ms: 100
+    sla_timeout_ms: 300
+
+  - name: "DBCheck"
+    cpu_cores: 1.0
+    sensitivity: "medium"
+    base_latency_ms: 500
+    sla_timeout_ms: 1500
+
+  - name: "APIGateway"
+    cpu_cores: 0.5
+    sensitivity: "low"
+    base_latency_ms: 50
+    sla_timeout_ms: 150
+
+  - name: "MediaTranscode"
+    cpu_cores: 4.0
+    sensitivity: "high"
+    base_latency_ms: 3000
+    sla_timeout_ms: 9000
+
+  - name: "ReportGen"
+    cpu_cores: 2.0
+    sensitivity: "medium"
+    base_latency_ms: 1500
+    sla_timeout_ms: 4500
+
+# 敏感度曲线参数（基于sensitivity等级生成）
+# 格式：CPU争抢程度(%) -> 性能退化系数
+# 性能退化 = (实际延迟 - 基线延迟) / 基线延迟
+sensitivity_curves:
+  high:
+    - [0, 0.00]
+    - [20, 0.08]
+    - [40, 0.25]
+    - [60, 0.55]
+    - [80, 0.85]
+    - [100, 0.98]
+    knee_point: 40    # 拐点
+    acceptable_degradation: 0.05  # 可接受5%退化
+
+  medium:
+    - [0, 0.00]
+    - [20, 0.03]
+    - [40, 0.10]
+    - [60, 0.25]
+    - [80, 0.50]
+    - [100, 0.80]
+    knee_point: 60
+    acceptable_degradation: 0.05
+
+  low:
+    - [0, 0.00]
+    - [20, 0.01]
+    - [40, 0.03]
+    - [60, 0.08]
+    - [80, 0.18]
+    - [100, 0.40]
+    knee_point: 75
+    acceptable_degradation: 0.05
+
+# 干扰模式配置
+interference_patterns:
+  periodic:
+    period: 30       # 周期（秒）
+    duration: 10     # 每次干扰持续时间
+    intensity: 0.3   # 强度
+
+  burst:
+    min_interval: 20   # 最小间隔
+    max_interval: 60   # 最大间隔
+    duration_range: [3, 8]  # 持续时间范围
+    intensity_range: [0.2, 0.5]
+
+  sustained:
+    start_time: 100    # 开始时间（秒）
+    duration: 60       # 持续时间
+    intensity: 0.15    # 强度

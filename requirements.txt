@@ -1,0 +1,31 @@
+# ResilientCPU - 基于干扰容忍的 FaaS 调度系统
+# =====================================================
+
+# 核心依赖
+numpy>=1.21.0
+scipy>=1.7.0
+pandas>=1.3.0
+matplotlib>=3.4.0
+seaborn>=0.11.0
+
+# 性能测试和并发
+aiohttp>=3.8.0
+asyncio>=3.4.3
+
+# 系统和容器管理
+psutil>=5.9.0
+docker>=6.0.0
+
+# 配置和日志
+PyYAML>=6.0
+colorlog>=6.7.0
+
+# 机器学习和曲线拟合
+scikit-learn>=1.0.0
+
+# 测试和验证
+pytest>=7.0.0
+pytest-asyncio>=0.18.0
+
+# 文档生成
+sphinx>=4.0.0

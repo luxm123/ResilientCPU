@@ -1,0 +1,47 @@
+# 实验配置文件
+# ==============
+
+# 仿真时长配置
+duration: 300          # 每个实验仿真时长（秒）
+warmup: 30            # 预热时间（秒）
+
+# 集群规模
+num_machines: 4       # 机器数量
+cpu_cores: 8          # 每台机器CPU核心数
+memory_per_machine_gb: 32
+
+# 调度策略对比
+strategies:
+  - "baseline"        # 保守调度（无敏感度信息）
+  - "aggressive"      # 激进超卖（无视干扰）
+  - "resilient"       # ResilientCPU（完整方案）
+
+# 干扰注入
+interference:
+  enabled: true
+  pattern: "burst"    # "periodic" | "burst" | "sustained" | "mixed"
+  intensity: 0.3      # 干扰强度（0-1）
+
+# 敏感度曲线参数
+sensitivity:
+  threshold: 0.95     # 使用敏感度曲线的置信度
+  borrow_ratio: 0.3   # 借用资源比例上限
+  compensation_delay_ms: 50  # 补偿延迟阈值
+
+# 监控参数
+monitor:
+  sample_interval: 0.1   # 采样间隔（秒）
+  window_size: 10        # 滑动窗口大小
+  alert_threshold: 1.5   # SLA告警阈值（倍数）
+
+# 负载生成
+workload:
+  base_arrival_rate: 50   # 基础到达率（请求/秒）
+  duration: 300           # 负载持续时间
+  pattern: "bursty"       # "uniform" | "poisson" | "bursty" | "diurnal"
+
+# 输出配置
+output:
+  results_dir: "results"
+  plots: true
+  save_checkpoints: false
